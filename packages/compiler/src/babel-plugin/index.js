@@ -9,9 +9,13 @@ import {
 import { diagnosticError, DiagnosticType } from "../babel-utils/diagnostics";
 import { getFileInternal, setFileInternal } from "../babel-utils/get-file";
 import { getTemplateId } from "../babel-utils/tags";
-import { buildLookup } from "../taglib";
+import { getLookupDependencies } from "../taglib";
+import {
+  CompileDependencies,
+  LookupDependencies,
+  stateOf,
+} from "../taglib/dependencies";
 import { buildCodeFrameError } from "../util/build-code-frame";
-import { stat } from "../util/fs";
 import throwAggregateError from "../util/merge-errors";
 import { Hash } from "../util/quick-hash";
 import { MarkoFile } from "./file";
@@ -88,7 +92,6 @@ export default (api) => {
         metadata.marko = shallowClone(sourceFile.metadata.marko);
 
         if (isMarkoOutput(markoOpts.output)) {
-          finalizeMeta(metadata.marko);
           return;
         }
 
@@ -99,7 +102,6 @@ export default (api) => {
           metadata.marko.diagnostics.some(isErrorDiagnostic)
         ) {
           file.path.node.body = [];
-          finalizeMeta(metadata.marko);
           return;
         }
 
@@ -126,7 +128,6 @@ export default (api) => {
         file.___compileStage = "translate";
         traverseAll(file, rootTranslators);
 
-        finalizeMeta(metadata.marko);
         if (this.hasLaterPlugins) {
           file.path.scope.crawl();
         }
@@ -164,14 +165,12 @@ function getMarkoFile(code, fileOpts, markoOpts) {
   const isSource = markoOpts.output === "source";
   const isMigrate = markoOpts.output === "migrate";
   const canCache = !(isSource || isMigrate);
-  const id = getTemplateId(markoOpts, filename);
   // `stripTypes` is left out of the key on purpose: it is for cli flows, which
   // compile once per process, so no cache is shared across its settings.
   const contentHash = canCache && new Hash().update(code).digest();
-  // Configs may share a cache only when they differ in `output` alone, as the
-  // bundler plugins' do: it keeps each template as analyzed, so only translate
-  // may read `output`.
-  let cached = canCache && compileCache.get(id);
+  // Kept as analyzed, by filename, so configs sharing a cache may differ only
+  // in `output`, which only translate reads.
+  let cached = canCache && compileCache.get(filename);
 
   // A template still analyzing is part of the analysis an import cycle led
   // back from, so it is current.
@@ -179,8 +178,11 @@ function getMarkoFile(code, fileOpts, markoOpts) {
     if (cached.contentHash !== contentHash) {
       // File content changed, invalidate the cache.
       cached = undefined;
-    } else if (hasStaleDependency(cached, markoOpts)) {
-      // Some dependency changed, invalidate the cache.
+    } else if (
+      cached.state !== stateOf(markoOpts.fileSystem) ||
+      cached.state.isStale(filename, cached.invalidations)
+    ) {
+      // The caches were cleared, or it was marked stale since.
       cached = undefined;
     }
   }
@@ -212,20 +214,25 @@ function getMarkoFile(code, fileOpts, markoOpts) {
     file.___compileStage = "parse";
     file.___getMarkoFile = getMarkoFile;
     file.___analyzedFiles = file.___loadedFiles = new Map();
-    const taglibLookup = (file.___taglibLookup = buildLookup(
+    const lookupDependencies = getLookupDependencies(
       path.dirname(filename),
       translator,
-      undefined,
       markoOpts.fileSystem,
-    ));
+    );
     const meta = (file.metadata.marko = {
-      id,
+      id: getTemplateId(markoOpts, filename),
       deps: [],
       tags: [],
+      dependencies: new CompileDependencies(lookupDependencies, filename),
+      // Kept empty for translators that predate `dependencies` and push to it.
       watchFiles: [],
       diagnostics: [],
       api: translator.preferAPI,
     });
+    // Only once the template goes stale with its lookup, as one that failed to
+    // build throws here.
+    const taglibLookup = (file.___taglibLookup =
+      LookupDependencies.getLayer(lookupDependencies));
 
     parseMarko(file);
     file.path.scope.crawl(); // Initialize bindings.
@@ -298,54 +305,51 @@ function getMarkoFile(code, fileOpts, markoOpts) {
     traverseAll(file, rootTransformers);
     file.path.scope.crawl();
 
-    for (const watchFile of taglibLookup.watchFiles) {
-      meta.watchFiles.push(watchFile);
-    }
-
-    compileCache.set(id, {
-      time: Date.now(),
+    const state = LookupDependencies.getState(lookupDependencies);
+    compileCache.set(filename, {
       file,
       contentHash,
+      state,
+      invalidations: state.invalidations,
     });
 
     if (translator.analyze) {
-      try {
-        file.___compileStage = "analyze";
-        traverseAll(file, translator.analyze);
+      file.___compileStage = "analyze";
+      traverseAll(file, translator.analyze);
 
-        if (!markoOpts.errorRecovery) {
-          // Analyze failures are recorded as error diagnostics so the whole
-          // template reports at once (and editors compiling with
-          // `errorRecovery` keep them as recoverable diagnostics); mirror
-          // the parse layer by throwing them together at the stage's end.
-          const seen = new Set();
-          const errors = [];
-          for (const diag of meta.diagnostics) {
-            if (diag.type !== DiagnosticType.Error) continue;
-            const key = `${
-              diag.loc ? `${diag.loc.start.line}:${diag.loc.start.column}` : ""
-            }:${diag.label}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            errors.push(
-              buildCodeFrameError(filename, file.code, diag.loc, diag.label),
-            );
-            if (errors.length === 8) break;
-          }
-
-          throwAggregateError(errors);
+      if (!markoOpts.errorRecovery) {
+        // Analyze failures are recorded as error diagnostics so the whole
+        // template reports at once (and editors compiling with
+        // `errorRecovery` keep them as recoverable diagnostics); mirror
+        // the parse layer by throwing them together at the stage's end.
+        const seen = new Set();
+        const errors = [];
+        for (const diag of meta.diagnostics) {
+          if (diag.type !== DiagnosticType.Error) continue;
+          const key = `${
+            diag.loc ? `${diag.loc.start.line}:${diag.loc.start.column}` : ""
+          }:${diag.label}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          errors.push(
+            buildCodeFrameError(filename, file.code, diag.loc, diag.label),
+          );
+          if (errors.length === 8) break;
         }
 
-        // Ready to translate; a file still at "analyze" is mid-analysis (an
-        // import cycle loaded it from inside its own analysis).
-        file.___compileStage = "translate";
-      } catch (e) {
-        compileCache.delete(id);
-        throw e;
+        throwAggregateError(errors);
       }
+
+      // Ready to translate; a file still at "analyze" is mid-analysis (an
+      // import cycle loaded it from inside its own analysis).
+      file.___compileStage = "translate";
     }
 
     return file;
+  } catch (err) {
+    // A compile that failed leaves no entry to hit.
+    if (canCache) compileCache.delete(filename);
+    throw err;
   } finally {
     setFileInternal(prevFile);
   }
@@ -353,34 +357,6 @@ function getMarkoFile(code, fileOpts, markoOpts) {
 
 function isErrorDiagnostic(diag) {
   return diag.type === DiagnosticType.Error;
-}
-
-function hasStaleDependency(cached, markoOpts) {
-  const seen = new Set();
-  const pending = [cached.file];
-  let file;
-
-  while ((file = pending.pop())) {
-    for (const watchFile of file.metadata.marko.watchFiles) {
-      if (isNewerThan(watchFile, cached.time, markoOpts)) return true;
-    }
-
-    // A child's own analysis feeds this file, so its children count too.
-    for (const [filename, analyzedFile] of file.___analyzedFiles) {
-      if (seen.has(filename)) continue;
-      seen.add(filename);
-      if (isNewerThan(filename, cached.time, markoOpts)) return true;
-      pending.push(analyzedFile);
-    }
-  }
-
-  return false;
-}
-
-function isNewerThan(filename, time, markoOpts) {
-  // An unreadable dependency invalidates, since its contribution is unknown.
-  const mtime = stat(markoOpts.fileSystem, filename)?.mtime ?? Infinity;
-  return mtime > time;
 }
 
 function shallowClone(data) {
@@ -409,6 +385,10 @@ function shallowClone(data) {
           case Date:
           case RegExp:
             clone[key] = new Ctor(v);
+            break;
+          // An output records its own reads atop its template's.
+          case CompileDependencies:
+            clone[key] = new CompileDependencies(v);
             break;
 
           default:
@@ -478,9 +458,7 @@ function traverseAll(file, visitors) {
 function addPlugin(meta, arr, plugin) {
   const hook = plugin.hook.default || plugin.hook;
 
-  if (plugin.path) {
-    meta.watchFiles.push(plugin.path);
-  }
+  CompileDependencies.addPlugin(meta.dependencies, plugin);
 
   if (Array.isArray(hook)) {
     arr.push(...hook);
@@ -549,11 +527,4 @@ function stripTypeImports(decl) {
 // keeping them would mean patching Babel's printer beyond our node types.
 function isMarkoOutput(output) {
   return output === "source" || output === "migrate";
-}
-
-function finalizeMeta(meta) {
-  meta.watchFiles = [...new Set(meta.watchFiles)];
-  if (meta.analyzedTags) {
-    meta.analyzedTags = [...meta.analyzedTags];
-  }
 }

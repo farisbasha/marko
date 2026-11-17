@@ -117,7 +117,7 @@ const config = {
   })(),
 
   /**
-   * Use a different file system object, eg webpack's CachedInputFileSystem.
+   * Reads through another file system: any object with the `fs` methods its type lists.
    */
   fileSystem: fs,
   /**

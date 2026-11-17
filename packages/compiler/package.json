@@ -30,7 +30,8 @@
     "babel-utils.js",
     "babel-utils.d.ts",
     "register.js",
-    "register.d.ts"
+    "register.d.ts",
+    "taglib.d.ts"
   ],
   "main": "src/index.js",
   "types": "index.d.ts",
@@ -50,6 +51,10 @@
     "./register": {
       "types": "./register.d.ts",
       "default": "./src/register.cjs"
+    },
+    "./taglib": {
+      "types": "./taglib.d.ts",
+      "default": "./src/taglib/index.ts"
     },
     "./modules": {
       "types": "./modules.d.ts",
@@ -100,6 +105,10 @@
     "./register": {
       "types": "./register.d.ts",
       "default": "./dist/register.js"
+    },
+    "./taglib": {
+      "types": "./taglib.d.ts",
+      "default": "./dist/taglib.js"
     },
     "./modules": "./modules.js",
     "./internal/babel": {

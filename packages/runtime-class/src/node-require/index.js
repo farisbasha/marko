@@ -64,12 +64,26 @@ function install(options) {
     extensions.push(".marko");
   }
 
+  // The compiler copies already revalidated this tick.
+  var revalidated = new Set();
+
   function markoRequireExtension(module, filename) {
     // Resolve the appropriate compiler relative to the location of the
     // marko template file on disk.
     var markoCompilerModulePath =
       createRequire(filename).resolve("@marko/compiler");
     var markoCompiler = require(markoCompilerModulePath);
+
+    // No watcher reports changes, so what each compiler's templates read is
+    // checked against disk once per tick; an older compiler checks on each hit.
+    if (!revalidated.has(markoCompiler)) {
+      if (!revalidated.size) setImmediate(() => revalidated.clear());
+      revalidated.add(markoCompiler);
+      markoCompiler.taglib.revalidate?.(
+        compilerOptions?.cache,
+        compilerOptions?.fileSystem,
+      );
+    }
 
     // Now use the appropriate Marko compiler to compile the Marko template
     // file to JavaScript source code:

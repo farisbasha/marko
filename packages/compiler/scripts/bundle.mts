@@ -163,6 +163,8 @@ await Promise.all([
       config: "src/config.js",
       register: "src/register.cjs",
       "babel-utils": "src/babel-utils/index.js",
+      // Tag lookups alone, without Babel.
+      taglib: "src/taglib/index.ts",
     },
     // Bare specifiers stay external, except the two self-references that are
     // themselves `src` code. Leaving those external would send a chunk back

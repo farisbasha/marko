@@ -628,6 +628,8 @@ describe("compiler/compile", () => {
     let dir;
     beforeEach(() => {
       dir = fs.mkdtempSync(path.join(os.tmpdir(), "marko-cache-"));
+      // A package of its own, so nothing above the directory is read.
+      fs.writeFileSync(path.join(dir, "package.json"), '{ "name": "app" }');
       fs.mkdirSync(path.join(dir, "tags"));
       fs.writeFileSync(
         path.join(dir, "template.marko"),
@@ -636,13 +638,11 @@ describe("compiler/compile", () => {
     });
     afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-    const writeTag = (name, src, offset = 1000) => {
+    // Written and reported, as a bundler's watcher does.
+    const writeTag = (name, src) => {
       const file = path.join(dir, "tags", `${name}.marko`);
       fs.writeFileSync(file, src);
-      // Pin the mtime away from now so neither invalidation nor a cache hit
-      // races the clock's resolution: ahead by default, behind when negative.
-      const at = new Date(Date.now() + offset);
-      fs.utimesSync(file, at, at);
+      taglib.invalidate([file]);
     };
 
     const compileParent = (cache) =>
@@ -662,13 +662,12 @@ describe("compiler/compile", () => {
         writeVersionComment: false,
       }).meta;
 
-    // A taglib file newer than every entry makes each of them stale, so these
-    // only compile if a compile checks each template once.
+    // A taglib file reported changed makes each entry stale, so these only
+    // compile if a compile checks each template once.
     const writeNewerTaglib = () => {
       const file = path.join(dir, "marko.json");
       fs.writeFileSync(file, "{}");
-      const ahead = new Date(Date.now() + 60_000);
-      fs.utimesSync(file, ahead, ahead);
+      taglib.invalidate([file]);
     };
 
     it("compiles a child against the analysis its parent read", () => {
@@ -705,18 +704,33 @@ describe("compiler/compile", () => {
       assert.match(compileParent(cache), /_var_resume/);
     });
 
-    it("lists each template a page entry reached as analyzed, so a change below it reaches the entry", () => {
-      writeTag("my-child", `<my-grandchild/y/>\n<return=y/>\n`);
-      writeTag("my-grandchild", `<return=1/>\n`);
-      assert.deepEqual(compilePage(new Map()).analyzedTags.toSorted(), [
-        path.join(dir, "tags", "my-child.marko"),
-        path.join(dir, "tags", "my-grandchild.marko"),
-      ]);
+    it("lists each template a page entry reached among what it read, once", () => {
+      // The last is reached under a root, then more eagerly beside it.
+      writeTag(
+        "tag-b",
+        `<let/n=1/>\n<button onClick() { n++ }>\${n}</button>\n<tag-d/>\n`,
+      );
+      writeTag("tag-c", `<tag-d/>\n`);
+      writeTag("tag-d", `<div/>\n`);
+      fs.writeFileSync(
+        path.join(dir, "template.marko"),
+        `<tag-b/>\n<tag-c/>\n`,
+      );
+      const templates = [];
+      taglib.forEachDependency(compilePage(new Map()).dependencies, (file) => {
+        if (file.endsWith(".marko")) templates.push(file);
+      });
+      assert.deepEqual(
+        templates.toSorted(),
+        ["tag-b", "tag-c", "tag-d"].map((name) =>
+          path.join(dir, "tags", `${name}.marko`),
+        ),
+      );
     });
 
     it("reads no template below a page entry again while their analyses are cached", () => {
-      writeTag("my-child", `<my-grandchild/y/>\n<return=y/>\n`, -60_000);
-      writeTag("my-grandchild", STATEFUL, -60_000);
+      writeTag("my-child", `<my-grandchild/y/>\n<return=y/>\n`);
+      writeTag("my-grandchild", STATEFUL);
       const reads = [];
       const fileSystem = {
         statSync: fs.statSync,

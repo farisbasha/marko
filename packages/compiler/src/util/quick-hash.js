@@ -5,6 +5,14 @@ export class Hash {
   a = 0xdeadbeef;
   b = 0x9e3779b9;
 
+  /** Starts from what `from` has had so far, or from nothing. */
+  constructor(from) {
+    if (from) {
+      this.a = from.a;
+      this.b = from.b;
+    }
+  }
+
   update(s) {
     let a = this.a;
     let b = this.b;
